@@ -1,4 +1,5 @@
-from typing import List, Literal, Iterable, Tuple, Optional, Dict
+import json
+from typing import List, Literal, Iterable, Tuple, Optional, Dict, Any, Callable
 
 import optuna
 import sklearn
@@ -9,6 +10,7 @@ from scipy.sparse import csr_matrix, hstack, lil_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import roc_auc_score
 import numpy as np
+import sqlite3
 
 def gini(y_true, y_score):
     return 2 * roc_auc_score(y_true, y_score) - 1.0
@@ -178,3 +180,84 @@ def get_oot_split_mask(cur_df: polars.DataFrame, trashold: str = "2024-11-01"):
     idx_val = np.where(mask_val)[0]
 
     return [(idx_train, idx_val)]
+
+class ExperimentStorage:
+    def __init__(self, db_path: str = "data/artifacts/experiments.db"):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS experiments
+            (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                name      TEXT NOT NULL,
+                mean_gini REAL NOT NULL
+            )
+            """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS optuna_runs
+            (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL,
+                best_gini   REAL    NOT NULL,
+                best_params TEXT    NOT NULL,
+                n_trials    INTEGER NOT NULL
+            );
+            """
+        )
+        self._conn.commit()
+
+    def evaluate(self, name: str, config: "LearnConfig", df: Any, split_masks: List,
+                 sparse_list: Optional[List] = None, verbose: bool = False) -> List[float]:
+        evaluated = self._conn.execute(
+            "SELECT mean_gini FROM experiments WHERE name = ?", (name,)
+        ).fetchone()
+        if evaluated:
+            if verbose:
+                print(f"  [{name}] cached: Gini = {evaluated[0]:.6f}")
+            return evaluated[0]
+
+        learning = LearnPipeline(**config.pipeline_args())
+        scores = learning.evaluate(df, sparse_list or [], split_masks, verbose=verbose)
+        mean = float(np.mean(scores))
+        self._conn.execute("INSERT INTO experiments (name, mean_gini) VALUES (?, ?)",
+                           (name, round(mean, 8)))
+        self._conn.commit()
+        if verbose:
+            print(f"[{name}] Gini = {mean:.6f}")
+        return scores
+
+    def evaluate_results(self):
+        return self._conn.execute(
+            "SELECT name, mean_gini FROM experiments ORDER BY mean_gini DESC"
+        ).fetchall()
+
+    def optimize(self, name: str, objective: Callable, n_trials: int = 50,
+                 verbose: bool = True, **study_kwargs) -> Tuple[float, Dict[str, Any]]:
+        optimized = self._conn.execute(
+            "SELECT best_gini, best_params FROM optuna_runs WHERE name = ?", (name,)
+        ).fetchone()
+        if optimized:
+            best_gini, best_params = optimized[0], json.loads(optimized[1])
+            if verbose:
+                print(f"[{name}] cached: best Gini = {best_gini:.6f}, params = {best_params}")
+            return best_gini, best_params
+
+        if not verbose:
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        study = optuna.create_study(direction="maximize", **study_kwargs)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+        self._conn.execute(
+            "INSERT INTO optuna_runs (name, best_gini, best_params, n_trials) VALUES (?, ?, ?, ?)",
+            (name, round(study.best_value, 8),
+             json.dumps(study.best_params, default=str), n_trials))
+        self._conn.commit()
+
+    def optuna_results(self):
+        """Все optuna-запуски, лучшие сверху."""
+        return self._conn.execute(
+            "SELECT name, best_gini, best_params, n_trials FROM optuna_runs ORDER BY best_gini DESC"
+        ).fetchall()
+

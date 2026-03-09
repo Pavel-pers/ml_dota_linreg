@@ -216,7 +216,7 @@ class LearnConfig:
         return None
 
     def suggest_text_feature(self, trial: Any, *,
-                             max_features_range: tuple = (500, 10000),
+                             max_features_range: tuple = (250, 5000),
                              min_df_range: tuple = (5, 100),
                              max_df_range: tuple = (0.8, 0.99),
                              allow_disable: bool = True):
