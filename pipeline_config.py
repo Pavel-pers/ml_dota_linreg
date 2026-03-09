@@ -9,6 +9,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from shared import HeroesEncoder
+from cuml.linear_model import LogisticRegression as cuLogisticRegression
 
 
 @dataclass
@@ -55,6 +56,7 @@ class LearnConfig:
         self._scaler_params: Dict[str, Any] = {}
         self._encoder_cls: Type = ce.OneHotEncoder
         self._encoder_params: Dict[str, Any] = {"use_cat_names": True}
+        self._use_gpu: bool = False
 
     # --- Dense features
 
@@ -250,6 +252,9 @@ class LearnConfig:
                       max_iter_range: tuple = (100, 2000),
                       solvers: List[str] = None,
                       sgd_losses: List[str] = None):
+        if check_sgd and self._use_gpu:
+            raise RuntimeError('cuml have no sgd')
+
         if solvers is None:
             solvers = ["lbfgs", "liblinear", "saga"]
         if sgd_losses is None:
@@ -264,8 +269,12 @@ class LearnConfig:
 
         if model_type == "logreg":
             C = trial.suggest_float("C", *C_range, log=True)
-            solver = trial.suggest_categorical("solver", solvers)
-            self.set_model(LogisticRegression, C=C, max_iter=max_iter, solver=solver)
+            max_iter = trial.suggest_int("max_iter", *max_iter_range)
+            if self._use_gpu:
+                self.set_model(cuLogisticRegression, C=C, max_iter=max_iter)
+            else:
+                solver = trial.suggest_categorical("solver", solvers)
+                self.set_model(LogisticRegression, C=C, max_iter=max_iter, solver=solver)
         else:
             alpha = trial.suggest_float("alpha", *alpha_range, log=True)
             loss = trial.suggest_categorical("sgd_loss", sgd_losses)

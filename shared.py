@@ -79,8 +79,15 @@ class LearnPipeline:
         if verbose:
             print(f'predict on {X_processed.shape} shape, df columns:', X.columns)
         if hasattr(self.model, "predict_proba"):
-            return self.model.predict_proba(X_processed)[:, 1]
-        return self.model.decision_function(X_processed)
+            preds = self.model.predict_proba(X_processed)[:, 1]
+        else:
+            preds = self.model.decision_function(X_processed)
+
+        if hasattr(preds, 'get'):
+            preds = preds.get()
+        elif hasattr(preds, 'to_numpy'):
+            preds = preds.to_numpy()
+        return preds
 
     def evaluate(self, df: polars.DataFrame, sparse_list: List[csr_matrix], split_masks: polars.DataFrame, verbose=False) -> List[float]:
         scores = []
@@ -208,7 +215,7 @@ class ExperimentStorage:
         self._conn.commit()
 
     def evaluate(self, name: str, config: "LearnConfig", df: Any, split_masks: List,
-                 sparse_list: Optional[List] = None, verbose: bool = False) -> List[float]:
+                 sparse_list: Optional[List] = None, verbose: bool = False) -> float:
         evaluated = self._conn.execute(
             "SELECT mean_gini FROM experiments WHERE name = ?", (name,)
         ).fetchone()
@@ -225,7 +232,7 @@ class ExperimentStorage:
         self._conn.commit()
         if verbose:
             print(f"[{name}] Gini = {mean:.6f}")
-        return scores
+        return mean
 
     def evaluate_results(self):
         return self._conn.execute(
@@ -247,17 +254,17 @@ class ExperimentStorage:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         study = optuna.create_study(direction="maximize", **study_kwargs)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True, n_jobs=-1)
 
         self._conn.execute(
             "INSERT INTO optuna_runs (name, best_gini, best_params, n_trials) VALUES (?, ?, ?, ?)",
             (name, round(study.best_value, 8),
              json.dumps(study.best_params, default=str), n_trials))
         self._conn.commit()
+        return study.best_value, study.best_params
 
     def optuna_results(self):
         """Все optuna-запуски, лучшие сверху."""
         return self._conn.execute(
             "SELECT name, best_gini, best_params, n_trials FROM optuna_runs ORDER BY best_gini DESC"
         ).fetchall()
-
