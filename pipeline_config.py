@@ -9,8 +9,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from shared import HeroesEncoder
-from cuml.linear_model import LogisticRegression as cuLogisticRegression
 
+try:
+    from cuml.linear_model import LogisticRegression as cuLogisticRegression
+    USE_CUDA = True
+except ImportError:
+    USE_CUDA = False
 
 @dataclass
 class FeatureGroup:
@@ -57,6 +61,10 @@ class LearnConfig:
         self._encoder_cls: Type = ce.OneHotEncoder
         self._encoder_params: Dict[str, Any] = {"use_cat_names": True}
         self._use_gpu: bool = False
+
+    def use_gpu(self, enabled: bool = True):
+        assert USE_CUDA
+        self._use_gpu = enabled
 
     # --- Dense features
 

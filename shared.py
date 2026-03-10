@@ -180,7 +180,7 @@ def get_oot_split(cur_df: polars.DataFrame, trashold: str = "2024-11-01"):
     return [(train_oot, validate_oot)]
 
 def get_oot_split_mask(cur_df: polars.DataFrame, trashold: str = "2024-11-01"):
-    mask_train = (cur_df['date'].cast(polars.String) < trashold).to_numpy()
+    mask_train = (cur_df['date'].cast(polars.String) < trashold).to_numpy().astype(bool)
     mask_val = ~mask_train
 
     idx_train = np.where(mask_train)[0]
