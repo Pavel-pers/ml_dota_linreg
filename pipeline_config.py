@@ -8,7 +8,8 @@ import sklearn.base
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, SGDClassifier
-from shared import HeroesEncoder
+from hero_encoder import HeroesEncoder
+from players_encoder import PlayerEncoder
 
 try:
     from cuml.linear_model import LogisticRegression as cuLogisticRegression
@@ -44,16 +45,25 @@ class HeroFeatureConfig:
     enabled: bool = True
 
 
+@dataclass
+class PlayerEncoderConfig:
+    encoder_instance: Any = None
+    feature_groups: Dict[str, List[str]] = None
+    enabled_groups: Optional[List[str]] = None
+    enabled: bool = True
+
+
 class LearnConfig:
     """Builder для LearnPipeline. Все мутирующие методы возвращают self."""
 
     def __init__(self, name: str = "default"):
-        self.nasme = name
+        self.name = name
         self._groups: Dict[str, FeatureGroup] = {}
         self._group_order: List[str] = []
         self._hero_config: Optional[HeroFeatureConfig] = None
         self._custom_sparse: Dict[str, Any] = {}
         self._text_config: Optional[TextFeatureConfig] = None
+        self._player_config: Optional[PlayerEncoderConfig] = None
         self._model_cls: Optional[Type] = None
         self._model_params: Dict[str, Any] = {}
         self._scaler_cls: Optional[Type] = StandardScaler
@@ -85,7 +95,6 @@ class LearnConfig:
     def add_hero_feature(self, radiant_encoder: Any = None,
                          dire_encoder: Any = None):
         if radiant_encoder is None or dire_encoder is None:
-            from shared import HeroesEncoder
             radiant_encoder = radiant_encoder or HeroesEncoder(pop_value=1)
             dire_encoder = dire_encoder or HeroesEncoder(pop_value=-1)
         self._hero_config = HeroFeatureConfig(deepcopy(radiant_encoder), deepcopy(dire_encoder))
@@ -106,7 +115,19 @@ class LearnConfig:
         if self._text_config:
             self._text_config.enabled = enabled
 
-    # --- Sparce encoders
+    # --- Player encoder
+
+    def set_player_encoder(self, player_encoder, enabled_groups: Optional[List[str]] = None):
+        self._player_config = PlayerEncoderConfig(
+            encoder_instance=player_encoder,
+            enabled_groups=enabled_groups,
+        )
+
+    def toggle_player_encoder(self, enabled: bool = True):
+        if self._player_config:
+            self._player_config.enabled = enabled
+
+    # --- Sparse encoders
 
     def add_sparse_feature(self, column_name: str, encoder: Any):
         self._custom_sparse[column_name] = deepcopy(encoder)
@@ -160,9 +181,30 @@ class LearnConfig:
     def has_text(self) -> bool:
         return self._text_config is not None and self._text_config.enabled
 
+    @property
+    def has_player_encoder(self) -> bool:
+        return self._player_config is not None and self._player_config.enabled
+
     # --- Build
 
     def pipeline_args(self) -> Dict[str, Any]:
+        player_encoder = None
+        if self.has_player_encoder:
+            player_encoder = self._player_config.encoder_instance
+            groups = player_encoder.get_feature_groups()
+            scaling_cols = set(player_encoder.get_scaling_columns())
+
+            enabled = self._player_config.enabled_groups
+            for group_name, cols in groups.items():
+                if enabled is not None and group_name not in enabled:
+                    continue
+                pe_group_name = f'pe_{group_name}'
+                if pe_group_name not in self._groups:
+                    should_scale = any(c in scaling_cols for c in cols)
+                    self.add_group(pe_group_name, cols, scaling=should_scale)
+        else:
+            player_encoder = None
+
         cat_cols = self.categorical_columns
         encoder = self._encoder_cls(cols=cat_cols, **self._encoder_params) if cat_cols else None
 
@@ -194,6 +236,7 @@ class LearnConfig:
             model=self._model_cls(**self._model_params),
             text_features=text_features,
             sparse_features=sparse_features,
+            player_encoder=player_encoder,
         )
 
     # --- Clone ---
@@ -212,17 +255,28 @@ class LearnConfig:
             if name in self._groups:
                 self.toggle_group(name, trial.suggest_categorical(f"use_{name}", [True, False]))
 
-
     def suggest_hero_encoder(self, trial: Any, *,
-                             allow_disable: bool = False):
+                             allow_disable: bool = False,
+                             allow_ngrams: bool = False,
+                             ngram_max_range: tuple = (1, 2),
+                             min_df_range: tuple = (30, 200)):
         if allow_disable:
             use = trial.suggest_categorical("use_heroes", [True, False])
             if not use:
                 self.toggle_hero_feature(False)
                 return None
 
+        if allow_ngrams:
+            ngram_max = trial.suggest_int("hero_ngram_max", *ngram_max_range)
+            min_df = trial.suggest_int("hero_min_df", *min_df_range) if ngram_max > 1 else 1
+        else:
+            ngram_max = 1
+            min_df = 1
+
         self._hero_config = HeroFeatureConfig(
-            HeroesEncoder(pop_value=1), HeroesEncoder(pop_value=-1))
+            HeroesEncoder(pop_value=1, ngram_range=(1, ngram_max), min_df=min_df),
+            HeroesEncoder(pop_value=-1, ngram_range=(1, ngram_max), min_df=min_df),
+        )
         return None
 
     def suggest_text_feature(self, trial: Any, *,
@@ -252,6 +306,30 @@ class LearnConfig:
 
         self.add_text_feature(vectorizer, use_radiant_chat=use_r, use_dire_chat=use_d)
         return None
+
+    def suggest_player_encoder(self, trial: Any,
+                               players_df=None,
+                               rank_n_matches_range: tuple = (2, 15),
+                               smoothing_range: tuple = (1.0, 20.0),
+                               exclude_accounts: set = None,
+                               group_names: Optional[List[str]] = None):
+        rank_n_matches = trial.suggest_int("player_rank_n_matches", *rank_n_matches_range)
+        smoothing = trial.suggest_float("player_smoothing", *smoothing_range, log=True)
+
+        pe = PlayerEncoder(
+            players_df=players_df,
+            rank_n_matches=rank_n_matches,
+            smoothing=smoothing,
+            exclude_accounts=exclude_accounts,
+        )
+
+        all_groups = ['player_rank_info', 'player_winrate', 'player_combat', 'player_economy', 'player_damage']
+        enabled = []
+        for gname in all_groups:
+            if trial.suggest_categorical(f"use_{gname}", [True, False]):
+                enabled.append(gname)
+
+        self.set_player_encoder(pe, enabled_groups=enabled)
 
     def suggest_model(self, trial: Any, *,
                       check_sgd: bool = False,
