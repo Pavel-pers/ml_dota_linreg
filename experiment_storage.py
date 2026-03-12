@@ -74,7 +74,7 @@ class ExperimentStorage:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         study = optuna.create_study(direction="maximize", **study_kwargs)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=True, n_jobs=-1)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True, n_jobs=2)
 
         self._conn.execute(
             "INSERT INTO optuna_runs (name, best_gini, best_params, n_trials) VALUES (?, ?, ?, ?)",
